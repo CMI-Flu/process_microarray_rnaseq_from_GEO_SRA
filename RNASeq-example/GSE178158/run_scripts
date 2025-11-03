@@ -1,0 +1,19 @@
+## Download runinfo from GE)/SRA
+
+esearch -db gds -query "GSE178158" | elink -target sra | efetch -format runinfo > runinfo.csv
+cut -d',' -f1 runinfo.csv | grep SRR > SRR_accessions.txt
+
+## Load NF-core modules
+module load nf-core
+export PATH=$HOME/tools:$PATH
+source ~/.bashrc
+nextflow -version
+cd /home/pshinde/repos/cmi-flu/transcriptomics/GSE178158
+
+
+## Create Design file
+echo "sample,fastq_1,fastq_2,strandedness" > design.csv
+for f in fastq/*_1.fastq.gz; do
+  base=$(basename $f _1.fastq.gz)
+  echo "$base,fastq/${base}_1.fastq.gz,fastq/${base}_2.fastq.gz,auto" >> design.csv
+done

@@ -1,0 +1,140 @@
+---
+title: "GSE29614 Microarray Processing (RMA → Gene-level median)"
+author: "Pramod"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+> **Pipeline**: GEO download → CEL extraction → `oligo::rma()` → probe→gene mapping (`hgu133plus2.db`) → per‑gene median → CSVs.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+## 1) Packages
+```{r install-load}
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+pkgs <- c("GEOquery","oligo","annotate","hgu133plus2.db","tidyverse")
+for (p in pkgs) {
+  if (!suppressWarnings(require(p, character.only = TRUE))) {
+    BiocManager::install(p, update = FALSE, ask = FALSE)
+    library(p, character.only = TRUE)
+  }
+}
+
+base_dir = "/home/pshinde/repos/cmi-flu/transcriptomics/microarray/GSE29614/"
+```
+
+## 2) Get GEO metadata and confirm platform
+
+```{r geo-meta}
+acc <- "GSE29614"
+gse <- getGEO(acc, GSEMatrix = FALSE)
+gpl_ids <- names(GPLList(gse))
+gpl_ids
+```
+
+*Expected*: **GPL570** (Affymetrix HG-U133 Plus 2.0). This notebook uses `hgu133plus2.db`.
+
+## 3) Download raw CEL files
+
+```{r download-cel, eval=TRUE}
+dir.create(acc, showWarnings = FALSE)
+GEOquery::getGEOSuppFiles(acc, baseDir = ".")
+raw_tar <- file.path(acc, paste0(acc, "_RAW.tar"))
+stopifnot(file.exists(raw_tar))
+
+cel_dir <- file.path(acc, "CEL_files")
+dir.create(cel_dir, showWarnings = FALSE)
+untar(raw_tar, exdir = cel_dir)
+
+# Many GEO tars contain gzipped CELs; gunzip if needed
+cel_gz <- list.files(cel_dir, pattern = "\\.CEL(\\.gz)?$", full.names = TRUE, recursive = TRUE)
+if (length(cel_gz) == 0) stop("No CEL files found after extraction. Check the supplement contents.")
+
+# Gunzip in place if required
+for (f in cel_gz) {
+  if (grepl("\\.gz$", f)) R.utils::gunzip(f, remove = TRUE, overwrite = TRUE)
+}
+
+```
+
+## 4) RMA normalization (oligo)
+
+```{r rma}
+cels <- list.files(cel_dir, pattern = "\\.CEL$", full.names = TRUE, recursive = TRUE)
+length(cels); head(cels)
+cels = paste0(base_dir, cels)
+raw <- read.celfiles(cels)
+eset <- oligo::rma(raw)
+
+exprs_mat <- Biobase::exprs(eset)
+dim(exprs_mat)
+```
+
+## 5) Probe → Gene mapping (hgu133plus2.db)
+
+```{r annotate}
+# Map Affy probe IDs (row names) to HGNC gene symbols
+probe_to_gene <- AnnotationDbi::select(hgu133plus2.db,
+                                       keys = rownames(exprs_mat),
+                                       columns = c("SYMBOL"),
+                                       keytype = "PROBEID")
+
+# Merge annotation to expression
+exprs_df <- cbind(PROBEID = rownames(exprs_mat), as.data.frame(exprs_mat, check.names = FALSE))
+annotated <- merge(exprs_df, probe_to_gene, by = "PROBEID", all.x = TRUE)
+annotated <- annotated[!is.na(annotated$SYMBOL) & annotated$SYMBOL != "", ]
+dim(annotated); head(annotated[, c(1, ncol(annotated)-0:0, 2:5)])
+```
+
+## 6) Collapse to per‑gene median expression
+
+```{r collapse-median}
+# Group by SYMBOL and take median across all probes per gene per sample
+gene_expr <- annotated |>
+  dplyr::group_by(SYMBOL) |>
+  dplyr::summarise(dplyr::across(where(is.numeric), median, na.rm = TRUE), .groups = "drop")
+
+# Make SYMBOL the first column
+gene_expr <- gene_expr |> dplyr::relocate(SYMBOL)
+dim(gene_expr); head(gene_expr)
+```
+
+## 7) Save outputs
+
+```{r save}
+out_dir <- "output_GSE29614"
+dir.create(out_dir, showWarnings = FALSE)
+readr::write_csv(as.data.frame(exprs_mat), file.path(out_dir, "GSE29614_probe_expression_RMA.csv"))
+readr::write_csv(gene_expr, file.path(out_dir, "GSE29614_gene_median_expression.csv"))
+
+# phenotype data for downstream analysis
+pheno <- Biobase::pData(eset)
+readr::write_csv(as.data.frame(pheno), file.path(out_dir, "GSE29614_pheno.csv"))
+
+list.files(out_dir, full.names = TRUE)
+```
+
+## 8) Quick QC: PCA (optional)
+
+```{r pca, fig.height=4.5, fig.width=6.5}
+mat <- t(scale(t(exprs_mat)))  # probe-level, z-score per probe (optional)
+pca <- prcomp(t(mat), center = TRUE, scale. = FALSE)
+plot(pca$x[,1], pca$x[,2],
+     xlab = paste0("PC1 (", round(100*summary(pca)$importance[2,1],1), "%)"),
+     ylab = paste0("PC2 (", round(100*summary(pca)$importance[2,2],1), "%)"),
+     pch = 19)
+text(pca$x[,1], pca$x[,2], labels = colnames(exprs_mat), pos = 3, cex = 0.7)
+```
+
+## 9) Session info
+
+```{r session-info}
+sessionInfo()
+```
+

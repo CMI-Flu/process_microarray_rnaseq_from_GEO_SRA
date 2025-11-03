@@ -1,0 +1,243 @@
+---
+title: "Illumina BeadChip processing: TXT + BGX → gene-level (median)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+This notebook ingests **multiple Illumina BeadChip sample files** (e.g., `GSM*.txt.gz`) and a **platform BGX** file (e.g., `GPL6947_*.bgx.gz`), then produces:
+- A merged **probe-level** matrix from `AVG_Signal` columns (one column per sample)
+- Optional **detection p-value** matrix
+- **Gene-level** median summary using platform annotation from the BGX
+- CSV outputs in an `output_illumina_bgx` folder
+
+> Assumptions:
+> - Files are in one directory (set `data_dir` below).
+> - Sample files contain columns like `AVG_Signal` and `Detection Pval`.
+> - Probe key is **Array_Address_Id** (preferred) or **ProbeID** (fallback).
+> - Platform annotation is provided via a **BGX** file (e.g., GPL6947).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = TRUE)
+```
+
+## 1) Packages
+
+```{r packages}
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+pkgs <- c("illuminaio","dplyr","readr","stringr","purrr","tidyr","Biobase")
+for (p in pkgs) {
+  if (!suppressWarnings(require(p, character.only = TRUE))) {
+    BiocManager::install(p, ask = FALSE, update = FALSE)
+    library(p, character.only = TRUE)
+  }
+}
+```
+
+## 2) Paths: set your data directory
+
+```{r paths}
+# CHANGE this to your folder containing BGX + GSM*.txt.gz files
+data_dir <- "GSE41080_RAW/CEL_files"
+
+# Auto-detect BGX (gz or plain)
+bgx_file <- list.files(data_dir, pattern = "\\.bgx(\\.gz)?$", full.names = TRUE)
+if (length(bgx_file) == 0) stop("No BGX file found in data_dir.")
+bgx_file <- bgx_file[1]  # if multiple, take the first for now
+
+# Sample files (gz or plain)
+sample_files <- list.files(data_dir, pattern = "^GSM.*\\.txt(\\.gz)?$", full.names = TRUE)
+if (length(sample_files) == 0) stop("No GSM*.txt(.gz) files found in data_dir.")
+length(sample_files); head(sample_files)
+```
+
+## 3) Read platform annotation (BGX)
+
+```{r read_bgx}
+bgx <- illuminaio::readBGX(bgx_file)
+
+# Inspect columns
+names(bgx)
+names(bgx$Probes)
+
+# Heuristic selection of key & symbol columns in BGX
+probe_df <- bgx$probes
+
+# Identify the probe key column:
+key_candidates <- c("ArrayAddressID","Array_Address_Id","ProbeID","Probe_Id","PROBE_ID","ProbeId")
+key_col <- key_candidates[key_candidates %in% names(probe_df)]
+if (length(key_col) == 0) stop("Could not find probe key column in BGX Probes table.")
+key_col <- key_col[1]
+
+# Identify a gene symbol column:
+symbol_candidates <- c("Symbol","ILMN_Gene","GeneSymbol","Gene Symbol","SYMBOL")
+sym_col <- symbol_candidates[symbol_candidates %in% names(probe_df)]
+if (length(sym_col) == 0) { sym_col <- NA_character_ }
+
+anno <- probe_df[, unique(na.omit(c(key_col, sym_col))) , drop = FALSE]
+colnames(anno)[1] <- "ProbeKey"
+if (ncol(anno) > 1) colnames(anno)[2] <- "SYMBOL" else anno$SYMBOL <- NA_character_
+
+# Drop duplicates in annotation
+anno <- anno[!duplicated(anno$ProbeKey), ]
+head(anno)
+```
+
+## 4) Read and merge all sample TXT files
+
+```{r read_merge}
+read_one_sample <- function(fpath) {
+  df <- suppressMessages(readr::read_tsv(fpath, comment = "#", guess_max = 200000))
+  cn <- names(df)
+  
+  # Probe key column is the first column (...1)
+  key_col <- cn[1]
+  
+  # Identify AVG_Signal and Detection_Pval columns
+  avg_col <- cn[grepl("AVG_Signal$", cn)]
+  det_col <- cn[grepl("Detection_Pval$", cn)]
+  
+  if (length(avg_col) == 0) stop(paste("No AVG_Signal column found in:", fpath))
+  avg_col <- avg_col[1]
+  det_col <- if (length(det_col) > 0) det_col[1] else NA_character_
+  
+  # Create a cleaned sample name based on file basename
+  sample_name <- gsub("\\.txt(\\.gz)?$", "", basename(fpath))
+  
+  # Extract expression
+  out <- df[, c(key_col, avg_col), drop = FALSE]
+  colnames(out) <- c("ProbeKey", sample_name)
+  
+  # Extract detection p-values (if available)
+  if (!is.na(det_col)) {
+    out_det <- df[, c(key_col, det_col), drop = FALSE]
+    colnames(out_det) <- c("ProbeKey", paste0(sample_name, ".detP"))
+  } else {
+    out_det <- NULL
+  }
+  
+  list(signal = out, detp = out_det)
+}
+
+
+lst <- lapply(sample_files, read_one_sample)
+signal_list <- lapply(lst, `[[`, "signal")
+detp_list   <- lapply(lst, `[[`, "detp")
+
+signal_merged <- Reduce(function(x,y) dplyr::full_join(x,y, by = "ProbeKey"), signal_list)
+
+detp_merged <- NULL
+if (all(!vapply(detp_list, is.null, logical(1)))) {
+  detp_merged <- Reduce(function(x,y) dplyr::full_join(x,y, by = "ProbeKey"), detp_list)
+}
+
+signal_merged <- signal_merged[!duplicated(signal_merged$ProbeKey), ]
+rownames(signal_merged) <- signal_merged$ProbeKey
+
+if (!is.null(detp_merged)) {
+  detp_merged <- detp_merged[match(rownames(signal_merged), detp_merged$ProbeKey), ]
+  rownames(detp_merged) <- detp_merged$ProbeKey
+}
+
+dim(signal_merged); head(signal_merged[, 1:5])
+if (!is.null(detp_merged)) { dim(detp_merged); head(detp_merged[, 1:5]) }
+```
+
+
+## 5) Preprocess: log2 + optional detection filtering
+
+```{r preprocess}
+rownames(signal_merged) = signal_merged$ProbeKey
+
+exprs_mat <- as.matrix(signal_merged[, setdiff(names(signal_merged), "ProbeKey")])
+storage.mode(exprs_mat) <- "double"
+
+rownames(exprs_mat) = rownames(signal_merged)
+# Log2 transform if clearly on raw scale
+if (is.finite(max(exprs_mat, na.rm = TRUE)) && max(exprs_mat, na.rm = TRUE) > 50) {
+  exprs_mat <- log2(exprs_mat + 1)
+}
+
+# Detection filter (keep probes with p<0.05 in >=50% samples)
+filter_fraction <- 0.1
+det_thresh <- 0.1
+keep_idx <- rep(TRUE, nrow(exprs_mat))
+if (!is.null(detp_merged)) {
+  det_mat <- as.matrix(detp_merged[, setdiff(names(detp_merged), "ProbeKey")])
+  storage.mode(det_mat) <- "double"
+  keep_idx <- rowMeans(det_mat < det_thresh, na.rm = TRUE) >= filter_fraction
+}
+
+exprs_mat_filt <- exprs_mat[keep_idx, , drop = FALSE]
+probe_keys <- rownames(exprs_mat_filt)
+dim(exprs_mat_filt)
+```
+
+## 6) Annotate via BGX and summarise median per gene
+
+```{r annotate_summarise}
+# 1. Clean probe IDs ONCE and keep them as characters
+clean_ids <- sub(".*?_", "", rownames(exprs_mat_filt))
+
+# 2. Apply cleaned probe IDs to the expression matrix rownames
+rownames(exprs_mat_filt) <- clean_ids
+
+# 3. Also clean IDs in the annotation table to match
+anno$ProbeKey_clean <- sub(".*?_", "", anno$ProbeKey)
+
+# 4. Now match annotation safely
+anno_sub <- anno[match(clean_ids, anno$ProbeKey_clean), , drop = FALSE]
+
+# 5. Combine expression + annotation without integer conversion
+exprs_df <- cbind(ProbeKey = clean_ids, as.data.frame(exprs_mat_filt, check.names = FALSE))
+
+# 6. Annotate
+annotated <- dplyr::left_join(exprs_df, anno_sub, by = c("ProbeKey" = "ProbeKey_clean"))
+
+# 7. Summarize at gene level
+gene_expr <- annotated %>%
+  dplyr::filter(!is.na(SYMBOL) & SYMBOL != "") %>%
+  dplyr::group_by(SYMBOL) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), median, na.rm = TRUE), .groups = "drop")
+
+```
+
+## 7) Save outputs
+
+```{r save}
+out_dir <- file.path("output_GSE41080")
+dir.create(out_dir, showWarnings = FALSE)
+
+readr::write_csv(data.frame(ProbeKey = rownames(exprs_mat), exprs_mat, check.names = FALSE),
+                 file.path(out_dir, "probe_level_matrix.csv"))
+readr::write_csv(gene_expr, file.path(out_dir, "gene_level_median_matrix.csv"))
+
+if (!is.null(detp_merged)) {
+  det_mat <- as.matrix(detp_merged[, setdiff(names(detp_merged), "ProbeKey")])
+  readr::write_csv(data.frame(ProbeKey = rownames(det_mat), det_mat, check.names = FALSE),
+                   file.path(out_dir, "detection_pvalues_matrix.csv"))
+}
+
+list.files(out_dir, full.names = TRUE)
+```
+
+## 8) Quick QC
+
+```{r qc, fig.height=4.5, fig.width=6.5}
+boxplot(exprs_mat, las = 2, cex.axis = 0.7, main = "Sample distributions (log2)")
+
+pca <- prcomp(t(exprs_mat), center = TRUE, scale. = TRUE)
+plot(pca$x[,1], pca$x[,2], pch = 19,
+     xlab = paste0("PC1 (", round(100*summary(pca)$importance[2,1],1), "%)"),
+     ylab = paste0("PC2 (", round(100*summary(pca)$importance[2,2],1), "%)"),
+     main = "PCA on merged expression")
+text(pca$x[,1], pca$x[,2], labels = colnames(exprs_mat), pos = 3, cex = 0.7)
+```
+
+## 9) Session info
+
+```{r session}
+sessionInfo()
+```

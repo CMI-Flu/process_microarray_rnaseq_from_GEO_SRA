@@ -1,0 +1,263 @@
+---
+title: "GSE59654 PBMC — Illumina HT-12 (GPL10558) Processing Pipeline"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+This notebook starts from a **single expression table** that contains columns like:
+
+- `ID_REF` (Illumina probe IDs such as `ILMN_1762337`)
+- Repeated pairs of: `<SampleName>` and `Detection Pval`
+
+It will:
+
+1. Load the table `GSE59654_PBMC.raw.corrected.txt`
+2. Split **expression** vs **detection p-value** columns
+3. Auto-detect whether values need **log2** transform
+4. Auto-detect which **GPL10558** annotation file (R1 or R2) best matches your probes
+5. Map **probe → gene symbol**
+6. Summarize to **gene-level** by **median** across probes
+7. Parse sample names like `110192_PBMC_0` into **Donor / Tissue / Time**
+8. Save outputs into an `output/` folder
+
+> Platforms: Illumina HumanHT-12 v4 (GPL10558).  
+> Inputs expected in the **working directory**:
+> - `GSE59654_PBMC.raw.corrected.txt`
+> - One or both annotation files:
+>   - `GPL10558_HumanHT-12_V4_0_R1_15002873_B.txt.gz`
+>   - `GPL10558_HumanHT-12_V4_0_R2_15002873_B.txt.gz`
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = TRUE)
+```
+
+## 1) Packages
+
+```{r packages}
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+pkgs <- c("readr","dplyr","stringr","tidyr")
+for (p in pkgs) {
+  if (!suppressWarnings(require(p, character.only = TRUE))) {
+    install.packages(p, dependencies = TRUE)
+    library(p, character.only = TRUE)
+  }
+}
+```
+
+## 2) Load expression + detection p-value table
+
+```{r load-input}
+expr_file <- "/home/pshinde/repos/cmi-flu/transcriptomics/microarray/GSE59654_illumina/GSE59654/GSE59654_PBMC.raw.corrected.txt"
+stopifnot(file.exists(expr_file))
+
+# readr auto-detects delimiter (tab/space) reasonably; force tsv if needed
+dat <- suppressMessages(readr::read_tsv(expr_file, guess_max = 200000))
+cn <- names(dat)
+if (!cn[1] %in% c("ID_REF","ProbeID","ID_REF ") ) {
+  message("Renaming first column to ID_REF for consistency")
+}
+colnames(dat)[1] <- "ID_REF"
+
+# Identify expression columns vs detection pvals
+is_det <- grepl("(?i)det(ection)?[ _]?p(val|value)", cn)
+is_id  <- names(dat) == "ID_REF"
+expr_cols <- setdiff(names(dat)[!is_det], "ID_REF")
+det_cols  <- names(dat)[is_det]
+
+length(expr_cols); length(det_cols)
+head(expr_cols, 6)
+```
+
+**Notes**  
+- `expr_cols` holds the expression columns (sample intensities).  
+- `det_cols` holds matching `Detection Pval` columns (if present).
+
+## 3) Build matrices
+
+```{r build-mats}
+# Expression matrix
+exprs_mat <- as.data.frame(dat[, c("ID_REF", expr_cols), drop = FALSE])
+# Coerce numeric columns
+for (j in seq_along(expr_cols)) {
+  exprs_mat[[expr_cols[j]]] <- suppressWarnings(as.numeric(exprs_mat[[expr_cols[j]]]))
+}
+rownames(exprs_mat) <- exprs_mat$ID_REF
+exprs_mat <- as.matrix(exprs_mat[, -1, drop = FALSE])
+
+# Detection matrix (optional)
+det_mat <- NULL
+if (length(det_cols) > 0) {
+  det_df <- as.data.frame(dat[, c("ID_REF", det_cols), drop = FALSE])
+  rownames(det_df) <- det_df$ID_REF
+  det_df <- det_df[, -1, drop = FALSE]
+  # Coerce numerics
+  for (j in seq_len(ncol(det_df))) det_df[[j]] <- suppressWarnings(as.numeric(det_df[[j]]))
+  det_mat <- as.matrix(det_df)
+}
+
+dim(exprs_mat)
+if (!is.null(det_mat)) dim(det_mat)
+```
+
+## 4) Log2 transform check
+
+```{r log2-check}
+needs_log2 <- is.finite(max(exprs_mat, na.rm = TRUE)) && max(exprs_mat, na.rm = TRUE) > 50
+if (needs_log2) {
+  message("Applying log2(x + 1) transform (values suggest raw scale).")
+  exprs_mat <- log2(exprs_mat + 1)
+} else {
+  message("Data appears to be already on log scale — no transform applied.")
+}
+```
+
+## 5) Auto-detect GPL10558 annotation (R1 vs R2)
+
+```{r detect-annot}
+annot_candidates <- c("/home/pshinde/repos/cmi-flu/transcriptomics/microarray/GSE59654_illumina/GSE59654/GPL10558_HumanHT-12_V4_0_R1_15002873_B.txt",
+                      "/home/pshinde/repos/cmi-flu/transcriptomics/microarray/GSE59654_illumina/GSE59654/GPL10558_HumanHT-12_V4_0_R2_15002873_B.txt")
+annot_candidates <- annot_candidates[file.exists(annot_candidates)]
+if (length(annot_candidates) == 0) stop("No GPL10558 annotation files found in working directory.")
+
+read_illumina_gpl <- function(path) {
+  # Read all lines
+  lines <- readLines(path)
+  
+  # Find where [Probes] section begins
+  start_idx <- grep("^\\[Probes\\]", lines)
+  if (length(start_idx) == 0) {
+    stop("No [Probes] section found in: ", path)
+  }
+  
+  # Data starts after [Probes]
+  start_idx <- start_idx + 1
+  
+  # Read the probes section
+  annot <- read.delim(path, skip = start_idx - 1, header = TRUE,
+                      stringsAsFactors = FALSE, check.names = FALSE)
+  
+  # Identify the probe ID column (Probe_Id preferred)
+  if ("Probe_Id" %in% names(annot)) {
+    annot$ProbeID <- annot$`Probe_Id`
+  } else if ("Array_Address_Id" %in% names(annot)) {
+    annot$ProbeID <- annot$`Array_Address_Id`
+  } else {
+    stop("No Probe_Id or Array_Address_Id found in annotation file.")
+  }
+  
+  # Extract gene symbol (Symbol preferred, fallback ILMN_Gene)
+  if ("Symbol" %in% names(annot)) {
+    annot$SYMBOL <- annot$Symbol
+  } else if ("ILMN_Gene" %in% names(annot)) {
+    annot$SYMBOL <- annot$ILMN_Gene
+  } else {
+    annot$SYMBOL <- NA_character_
+  }
+  
+  # Keep relevant columns and remove duplicates
+  annot <- annot[, c("ProbeID", "SYMBOL"), drop = FALSE]
+  annot <- annot[!duplicated(annot$ProbeID), ]
+  
+  return(annot)
+}
+
+
+
+annot_list <- lapply(annot_candidates, read_illumina_gpl)
+
+# Pick the best by overlap with probe IDs in expression
+probe_ids <- rownames(exprs_mat)
+overlaps <- sapply(annot_list, function(a) sum(probe_ids %in% a$ProbeID))
+best_idx <- which.max(overlaps)
+annot <- annot_list[[best_idx]]
+annot_used <- annot_candidates[best_idx]
+
+message(paste("Annotation selected:", annot_used))
+head(annot)
+```
+
+## 6) Optional: detection p-value filtering (OFF by default)
+
+```{r filter, eval=TRUE}
+# Default OFF: set do_filter <- TRUE to enable
+do_filter <- FALSE
+det_thresh <- 0.05
+filter_fraction <- 0.5
+
+keep_idx <- rep(TRUE, nrow(exprs_mat))
+if (do_filter && !is.null(det_mat)) {
+  common <- intersect(rownames(exprs_mat), rownames(det_mat))
+  kdet <- det_mat[common, , drop = FALSE]
+  kexp <- exprs_mat[common, , drop = FALSE]
+  keep_idx <- rowMeans(kdet < det_thresh, na.rm = TRUE) >= filter_fraction
+  exprs_mat <- kexp[keep_idx, , drop = FALSE]
+}
+dim(exprs_mat)
+```
+
+## 7) Probe → Gene mapping and gene-level median summarization
+
+```{r probe2gene}
+exprs_df <- data.frame(ProbeID = rownames(exprs_mat), exprs_mat, check.names = FALSE)
+
+exprs_annot <- dplyr::left_join(exprs_df, annot, by = "ProbeID")
+mapped <- exprs_annot %>% dplyr::filter(!is.na(SYMBOL) & SYMBOL != "")
+
+gene_expr <- mapped %>%
+  dplyr::group_by(SYMBOL) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), median, na.rm = TRUE), .groups = "drop")
+
+# Tidy rownames
+gene_mat <- as.data.frame(gene_expr, check.names = FALSE)
+rownames(gene_mat) <- gene_mat$SYMBOL
+gene_mat <- gene_mat[, -1, drop = FALSE]
+
+dim(gene_mat); head(gene_mat[,1:min(5,ncol(gene_mat))])
+```
+
+
+
+## 9) Save outputs
+
+```{r save}
+out_dir <- "GSE59654_output"
+dir.create(out_dir, showWarnings = FALSE)
+
+readr::write_csv(data.frame(ProbeID = rownames(exprs_mat), exprs_mat, check.names = FALSE),
+                 file.path(out_dir, "GSE59654_probe_level.csv"))
+readr::write_csv(data.frame(GENE = rownames(gene_mat), gene_mat, check.names = FALSE),
+                 file.path(out_dir, "GSE59654_gene_level.csv"))
+
+
+writeLines(paste0("Annotation used: ", annot_used,
+                  "\nProbes mapped to genes: ", nrow(mapped),
+                  " / ", nrow(exprs_mat)),
+           con = file.path(out_dir, "annotation_used.txt"))
+
+list.files(out_dir, full.names = TRUE)
+```
+
+## 10) Quick sanity QC (boxplot + PCA)
+
+```{r qc, fig.height=4.5, fig.width=6.5}
+# Boxplot of sample distributions (gene-level)
+boxplot(gene_mat, las = 2, cex.axis = 0.6, main = "Gene-level (median) distributions")
+
+# PCA on gene-level
+pca <- prcomp(t(gene_mat), center = TRUE, scale. = TRUE)
+plot(pca$x[,1], pca$x[,2], pch = 19,
+     xlab = paste0("PC1 (", round(100*summary(pca)$importance[2,1],1), "%)"),
+     ylab = paste0("PC2 (", round(100*summary(pca)$importance[2,2],1), "%)"),
+     main = "PCA — gene-level matrix")
+text(pca$x[,1], pca$x[,2], labels = rownames(pca$x), pos = 3, cex = 0.6)
+```
+
+## 11) Session info
+
+```{r session}
+sessionInfo()
+```
