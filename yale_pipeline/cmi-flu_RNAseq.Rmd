@@ -1,0 +1,859 @@
+---
+title: "Data Integration for an ImmPort SDY Study"
+author: "Jian Xing"
+date: "2025-05-20"
+---
+OVERVIEW
+
+Use this code to gather and integrate data for an ImmPort SDY, from ImmPort,GEO and SRA.
+ 
+This is a new version to run that will automatically download the SDY tab file from ImmPort and then process it.
+
+Most functions can be also done on the local computer, except automated ImmPort download & SRA download.
+
+Various tables from the Tab file are parsed and a dataframe of ImmPort 
+ metadata is created, including a field for GSM (GEO sample accession)
+
+From the GSMs, the associated GEO series are determined. 
+
+The user can run different sections based on the type of data and what the desired output is:
+
+For bulk RNA-seq: The general plan is to download the raw data (fastq files). The GEO series are determined and the metadata is merged with the ImmPort metadata. 
+  SRA accessions for each sample are determined; expected file names for each sample added to the metadata. A dSQ job array is constructed which will run SRA-Toolkit to download the FASTQ files.
+ 
+For sc Assays: The general plan is to download the raw data (fastq files). The 
+  GEO series are determined and the metadata is merged with the ImmPort metadata. 
+  SRA accessions for each sample are determined; expected file names for each sample added to the metadata. A dSQ job array is constructed which will run SRA-Toolkit to download the FASTQ files.
+  
+For micro array assays: The metadata and intensity data is downloaded from GEO. For microarray data, the intensity matrices are more tightly integrated with the GEO record than for bulk; therefore the matrix already has the proper GSM column names, so no renaming is done. A summarized experiment object is created for each GSE associated with the ImmPort ID.
+ 
+# Libraries
+To get data from GEO / SRA
+GEOquery: https://www.bioconductor.org/packages/release/bioc/html/GEOquery.html
+GEOfastq: https://bioconductor.org/packages/release/bioc/html/GEOfastq.html
+
+The column renaming strategy utilizes longest common substring of two strings.
+The PTXQC package, designed for proteomics, has a convenient function, LCS, to compute this.
+https://cran.r-project.org/web/packages/PTXQC
+
+```{r echo=FALSE}
+library(GEOquery)
+library(GEOfastq)
+library(dplyr)
+library(fs)
+library(data.table)
+library(SummarizedExperiment)
+library(openxlsx)
+library(PTXQC)
+library(stringr)
+library(rentrez)
+```
+
+# Functions
+
+```{r echo=FALSE}
+list_gse <- function(gsm_list){
+  # function to generate a list of unique GEO Accession IDs for a given list of
+  #  GSM IDs; this is necessary since the ImmPort templates have GSM but not GSE.
+  
+  # empty list to add gse ids to
+  gse_list <- list()
+  
+  # loop gsm_list & get GSE's
+  for (gsm_id in gsm_list){
+    gsm <- getGEO(gsm_id)
+    gse_list <- append(gse_list,Meta(gsm)$series_id)
+  }
+  
+  # get unique values from list
+  return (unique(gse_list))
+}
+
+process_sdy <- function(pth){/gibbs/project/kleinstein/jx299/signature/signatures_pipeline
+  # function takes the path to an ImmPort Tab dir, parses it and returns a 
+  #  dataframe of data from multiple ImmPort files (tables)
+  
+  # get filename without extension, this is the part that's unique, has the
+  #  study accession
+  f <- tools::file_path_sans_ext(path_file(pth))
+  
+  # make individual df's
+  df_sub <- fread(file.path(pth,"Tab","subject.txt"))
+  df_bs <- fread(file.path(pth,"Tab","biosample.txt"))
+  df_e2b <- fread(file.path(pth,"Tab","expsample_2_biosample.txt"))
+  df_es <- fread(file.path(pth,"Tab","expsample.txt"))
+  df_exp <- fread(file.path(pth,"Tab","experiment.txt"))
+  df_a2s <- fread(file.path(pth,"Tab","arm_2_subject.txt"))
+  df_rep <- fread(file.path(pth,"Tab","expsample_public_repository.txt"))
+  
+  # if no repo data then we're done, quit with message
+  if(nrow(df_rep)==0){
+    stop("No Repo Data")
+  }else{
+  
+  # combine into one df for that SDY
+  # also filter for the odd case where ImmPort has SRA records as well
+  df_all <- df_rep %>% select(-"RESULT_ID") %>%
+    inner_join(select(df_es,"EXPSAMPLE_ACCESSION", "EXPERIMENT_ACCESSION"), by="EXPSAMPLE_ACCESSION") %>%
+    inner_join(select(df_exp,-c("DESCRIPTION", "STUDY_ACCESSION","WORKSPACE_ID" )),
+               by="EXPERIMENT_ACCESSION") %>%
+    inner_join(df_e2b, by="EXPSAMPLE_ACCESSION") %>%
+    inner_join(select(df_bs,-c("DESCRIPTION","NAME","STUDY_TIME_T0_EVENT_SPECIFY","SUBTYPE",
+                               "WORKSPACE_ID")), by="BIOSAMPLE_ACCESSION") %>%
+    inner_join(select(df_sub,c("SUBJECT_ACCESSION","GENDER")), by="SUBJECT_ACCESSION") %>%
+    inner_join(select(df_a2s,c("SUBJECT_ACCESSION","AGE_UNIT","MAX_SUBJECT_AGE","MIN_SUBJECT_AGE"))
+               ,df_a2s, by="SUBJECT_ACCESSION") %>%
+    filter(grepl("^GSM",REPOSITORY_ACCESSION))
+  }
+  
+  return(df_all)
+}
+
+parse_count_df <- function(df_counts){
+  # The input df is derived from a GEO series supplemental file; it's format
+  #  is not guaranteed to be standardized. This function wants to return a 
+  #  df that has only numeric sample counts, with the most appropriate row 
+  #  index available, to be used to construct an SE object.
+  
+  # split df into non-numeric & numeric dfs
+  df_counts_num <- df_counts %>% select(where(is.numeric))
+  df_counts_char <- df_counts %>% select(!where(is.numeric))
+  
+  # remove 'Length' column if present
+  if ("Length" %in% colnames(df_counts_num)) {
+    df_counts_num <- df_counts_num %>% select(-Length)
+  }
+  
+  # check number of columns in non-numeric df, act accordingly
+  nc_char <-ncol(df_counts_char)
+  
+  # if 0 columns return original df
+  if (nc_char == 0){
+    return (df_counts)
+  }else if (nc_char == 1){
+    # if 1, then return original df with char column as index
+    row.names(df_counts_num) <-df_counts_char[,1]
+    return(df_counts_num)
+  }else if (nc_char >1){
+    # look for ENSG data in non-numeric df and set as rowname
+    # Otherwise look for gene or symbol column and use it
+    # Since ENSG is priority, check first; if not found then
+    #  start over & look for "gene" or "symbol
+    # check for ENSG
+    i <- which(grepl("ENSG\\d+", df_counts_char, ignore.case = T))
+    if(isTRUE(as.logical(i))){
+      row.names(df_counts_num) <- df_counts_char[[i]]
+      return(df_counts_num)
+    }
+    # check for gene or symbol in col names
+    col_names <- colnames(df_counts_char)
+    patterns <- c("GENE", "SYMBOL")
+    i <- which(grepl(paste(patterns, collapse = "|"), col_names, ignore.case = T))
+    if(isTRUE(as.logical(i))){
+      row.names(df_counts_num) <- make.names(df_counts_char[[i]], unique = T)
+      return(df_counts_num)
+    }
+  }
+}
+
+update_ImmPort_meta <- function (immport_meta_df, gsm_id, col_name, cell_value){
+  # generic function to update or add columns to immport metadata dataframe
+  row_idx <- grep(gsm_id, immport_meta_df$REPOSITORY_ACCESSION)
+  if(isTRUE(as.logical(row_idx))){
+    immport_meta_df[row_idx, col_name] <- cell_value
+  }
+  return (immport_meta_df)
+}
+
+find_LCS_idx <- function(cn, v){
+  # return longest common substring from cn & V
+  # cn is a single string, v is a vector of strings
+  
+  # rm NAs from v, as it may be all NA'a and this seems to cause an issue
+  #  with LCS
+  v <- na.omit(v)
+  
+  results <- lapply(v,LCS,s2=cn)
+  lcs<-(na.omit(results[nchar(results)==max(nchar(results))]))
+  # if result is unambiguous return result else return 0
+  if(length(lcs)==1){
+    idx<-grep(lcs,v)
+    return(idx)
+  # if the special case where there are exactly 2 LCS, offer chance to resolve
+  #  manually
+  }else if(length(lcs)==2){
+    print("Trying to resolve similar entries")
+    idxs<-grep(lcs,v)
+    print(cn)
+    #print(paste(v[idxs[1]], ":", v[idxs[2]]))
+    cat(v[idxs[1]], ":", v[idxs[2]])
+    choice <- readline(prompt = "1 or 2? ")
+    choice_idx <- idxs[as.integer(choice)]
+    cat(v[choice_idx], "\n\n")
+    return(choice_idx)
+  }else{
+    return(0)
+  }
+  
+}
+
+parse_xlsx_counts <- function(xlsx_file){
+  # xlxs may have >1 sheet
+  sheetNames <- getSheetNames(xlsx_file)
+  # empty list to hold 1 df per sheet
+  sheetData <- list()
+  # for each sheet, read data then add to list
+  for (i in seq_along(sheetNames)){
+    sheetData[[i]]<- read.xlsx(xlsx_file, sheet = sheetNames[i], colNames = T)
+  }
+  # reduce / merge list to single dataframe (code shamelessly poached online)
+  df_counts <- Reduce(function(x, y) merge(x, y, all=TRUE), sheetData)
+  return(df_counts)
+}
+
+parse_tar_counts <- function(tar_file){
+  # function to deal with a count file for a single sample
+  # get tar file, unpack, process each indv file, bind and return df
+  # the tar file was downloaded by getGEO, mk a sub-dir under that directory
+  p_dir <- path(path_dir(tar_file), "extract")
+  # un tar the file
+  untar(tar_file, list = F, exdir = p_dir)
+  # delete any files ending with "_mixcr.txt.gz"
+  mixcr_files <- list.files(p_dir, pattern = "_mixcr\\.txt\\.gz$", full.names = TRUE)
+  if (length(mixcr_files) > 0) {
+    file.remove(mixcr_files)
+  }
+  
+  # make list of unpacked files
+  gz_list <- list.files(p_dir, full.names = T)
+  # make empty list to store each gz file's dataframe
+  df_list <- list()
+  # loop gz files
+  for (f in gz_list){
+    # read data in to df
+    df_temp <- as.data.frame(fread(f))
+    # use parse_count_df to set row index and rm any other text cols
+    df_temp <- parse_count_df(df_temp)
+    
+    # here we assume (hope) the gz file name includes the sample name or ID,  
+    #  so were setting that file name as the column name
+    # this will be subject to the same renaming scheme later
+    colnames(df_temp)<- tools::file_path_sans_ext(path_file(f))
+    df_list <- append(df_list, list(df_temp))
+  }
+  # bind into a single df & return
+  df_counts_all <- bind_cols(df_list)
+  return(df_counts_all)
+}
+
+gsm_sra <- function(gse_id){
+  # get gsms, related metadata from GEO & SRA
+  # return df of gsms & SRA accessions / file names
+  
+  # get metadata from GEO
+  gse_text <- crawl_gse(gse_id)
+  
+  # extract sample accessions
+  gsm_names <- extract_gsms(gse_text)
+  
+  # make empty dataframe to hold gsms & assumed file names
+  gsm_fastq <- setNames(data.frame(matrix(ncol = 4, nrow = 0)), 
+                        c("REPOSITORY_ACCESSION", "R1_file", "R2_file", "R3_file"))
+  
+  # loop gsm_names, get fastq file names / meta for each
+  for (gsm_name in  gsm_names){
+    # get sra metadata
+    # seems to fail if >1 SRA link ??
+    srp_meta <- crawl_gsms(gsm_name)
+    
+    # will be empty if records are not released
+    if(length(srp_meta) == 0) {
+      print("No srp data found!")
+    }else{
+      # get srr IDs from row names
+      srr_list <- row.names(srp_meta)
+      # SRP can have >1 SRR
+      for(srr in srr_list){
+        # get SRR meta from Entrez, determine # of read files (i.e. 1,2 or 3)
+        srr_entrez <- entrez_fetch(db="SRA", id=srr, rettype = "XML")
+        num_files <- as.integer(str_extract(srr_entrez, pattern = "nreads=\"(\\d)\"", group=1))
+        
+        # make a file list based on num_files
+        file_list <- list()
+        for (i in 1:num_files){
+          file_list <- append(file_list, paste(srr,i,sep = "_"))
+        }
+        # pad list for rbind to work
+        pad_str <- rep(NA,3-num_files)
+
+        # add new row to df; gsm followed by list of file names
+        new_row <- c(gsm_name, file_list,pad_str)
+        
+        # add to gsm_fastq df
+        gsm_fastq <- rbind(gsm_fastq, new_row)
+      }
+    }
+  }
+  # restore col nmaes
+  colnames(gsm_fastq) <- c("REPOSITORY_ACCESSION", "R1_file", "R2_file", "R3_file")
+  # if there's no file3, it is set to NA and R apparently sets that as type 
+  #  logical, which may break rows_append() later
+  gsm_fastq <- gsm_fastq %>% mutate(across(everything(), as.character))
+  return(gsm_fastq)
+}
+
+sra_download_bak <- function(gse_id, dl_dir){
+  prefetch_cmd <- "/vast/palmer/apps/avx2/software/SRA-Toolkit/3.0.10-gompi-2022b/bin/prefetch"
+  fq_dump_cmd <- "/vast/palmer/apps/avx2/software/SRA-Toolkit/3.0.10-gompi-2022b/bin/fasterq-dump --split-files --include-technical"
+  # get metadata from GEO
+  gse_text <- crawl_gse(gse_id)
+  
+  # extract sample accessions
+  gsm_names <- extract_gsms(gse_text)
+  
+  # make empty dataframe to hold gsms & srr numbers
+  gsm_fastq <- setNames(data.frame(matrix(ncol = 4, nrow = 0)), 
+                        c("gsm", "R1_file", "R2_file", "R3_file"))
+  
+  # loop gsm_names, get fastq files for each
+  for (gsm_name in  gsm_names[1]){
+    # get sra metadata
+    # seems to fail if >1 SRA link ??
+    srp_meta <- crawl_gsms(gsm_name)
+    
+    # check srp_meta for library_layout (SINGLE or PAIRED)
+    # lib_layout <- srp_meta$library_layout
+    
+    # will be empty if records are not released
+    if(length(srp_meta) == 0) {
+      print("No srp data found!")
+    }else{
+      # get srr from row name of first row
+      srr_list <- row.names(srp_meta)
+      # SRP can have >1 SRR
+      for(srr in srr_list[1]){
+        # do the prefetch
+        system(paste(prefetch_cmd, "-O", dl_dir, srr))
+        # run fasterq-dump
+        system(paste(fq_dump_cmd, "-O", dl_dir,srr))
+        
+        # get list of files generated by fasterq-dump
+        ls_cmd <- paste0("ls ", out_path, "/", srr, "*.fastq")
+        path_list <- system(ls_cmd, intern = T)
+        # get base names of files
+        file_list <- basename(path_list)
+        # make new row with gsm
+        new_row <- c(gsm_name, file_list)
+        # add to gsm_fastq df
+        gsm_fastq <- rbind(gsm_fastq, new_row)
+        
+        # # update gsm_fastq df
+        # new_row <- c(gsm_name, paste0(srr, "_1.fastq"))
+        # if(lib_layout[1] == "PAIRED"){
+        #   new_row <- append(new_row, paste0(srr, "_2.fastq"))
+        # }
+        # gsm_fastq <- rbind(gsm_fastq, new_row)
+      }
+    }
+  }
+  # restore col names
+  colnames(gsm_fastq) <- c("gsm", "R1_file", "R2_file", "R3_file")
+  return(gsm_fastq)
+}
+```
+
+# Pipeline Setup
+
+Specify the following here:
+  - SDY ID & data release (DR)
+  - ImmPort account credentials
+  - Path to ImmPort download script - The ImmPort download script is a separate 
+      script provided by ImmPort. It uses Aspera, which is installed on McCleary. 
+      Some paths have been changed from the defaults to match McCleary.
+  - work directory
+
+```{r echo=FALSE}
+# set work directory
+# just a global variable since setwd() is not persistent in a notebook
+work_dir <- "WORKPATH"
+# ImmPort data release version
+# If this is out of date looks like a file not found error is raised
+DR <- "DR54"
+dl_script <- "downloadImmportData.sh"
+
+# Immport Study ID
+SDY <- "SDYXXXX"
+
+
+# ImmPort user name / password
+user <- "Username"
+pass <- "Password"
+```
+
+# Download Tab file for SDY from ImmPort & unzip
+NOTE: Automated download requires that the Aspera libraries are installed on your system and that the download script is setup for your system's paths.Can be setup on your local system if it's running linux. Instructions can be found here:  docs.immport.org/filedownload/tool/#
+  
+  On the local system you can also manually download the tab file (parsed) then proceed ith the rest of this code block.
+  
+  The ImmPort tab file is a gziped file that contains text data files for each ImmPort table for a given study. The tab file follows a standard namingconvention that includes the SDY ID & data release, which we specified in an earlier chunk.
+  
+  Once downloaded we unzip it; in the next chunk we extract data from some of the files.
+
+```{r}
+# dynamically set tab file name from settings for SDY & data release version
+tab_file_name <- paste0("/", SDY, "/", SDY, "-", DR, "_Tab.zip")
+
+# call download script which will get SDY tab file and download to cwd
+# set wd
+setwd(work_dir)
+system(paste(dl_script, user, pass, tab_file_name))
+
+# IF RUNNING ON LOCAL MACHINE, edit the tab_path to reflect where you downloaded
+#  the tab.zip file
+# path to tab file
+tab_path <- paste0(work_dir, tab_file_name)
+
+# unzip to same dir
+ext_path <- paste0(work_dir, "/", SDY)
+
+unzip(tab_path, exdir = ext_path)
+```
+
+# Process the ImmPort Study
+This chunck calls a function that parses the study metadata from several files into a single dataframe
+
+```{r}
+# construct path to unzipped dir
+pth <- paste0(ext_path, "/", SDY, "-", DR, "_Tab")
+
+# set output path
+out_path <- path(pth, "output")
+  
+# get name of sdy Tab file from pth, for use later
+sdy_file_name <- tools::file_path_sans_ext(path_file(pth))
+sdy_id <-str_match(sdy_file_name, "SDY\\d+")[1]
+  
+# call function to process study
+sdy_df <- process_sdy(pth)
+df_pth <- paste0(ext_path, '/', sdy_id, '_df.csv')
+write.csv(sdy_df,df_pth)
+
+```
+
+# Get the GSEs
+ImmPort does not store the GSE IDs; each sample has a GSM.
+So we collect the GSMs and generate a list of unique GSE's that contain them.
+
+```{r echo=FALSE}
+# get all gsm's from df
+gsm_list <- sdy_df$REPOSITORY_ACCESSION
+
+# apparently some SDYs have SRA entries as well, so we need to check &
+#  filter to just those that start with"GSM"
+gsm_list <- gsm_list[grepl("^GSM",gsm_list)]
+  
+# call function to get unique GSE values from list
+# an SDY could have gsms in > 1 gse
+gse_list <- list_gse(gsm_list)
+print(gse_list)
+```
+
+# Check GSE list.
+Remove GSE's that are super-series.
+Super series list all of the samples of the sub-series, so I think there is potential for duplication here. Let's try to filter out super-series by examining the relation attribute, found at:
+experimentData(g[[i]])@other$relation
+
+Print the overall design field, to see if series is single-cell, bulk or array
+
+```{r echo=FALSE}
+# new list of GSEs to process (character vector)
+gse_list_proc <- character(0)
+
+# helper: detect single-cell keywords in a text blob
+is_single_cell_blob <- function(txt) {
+  if (is.null(txt) || length(txt) == 0) return(FALSE)
+  blob <- tolower(paste(txt, collapse = " "))
+  kw <- c(
+    "single cell", "single-cell", "single nucleus", "single-nucleus",
+    "scrna", "sc-rna", "sc rna",
+    "snrna", "sn-rna", "sn rna",
+    "10x", "10x genomics", "chromium",
+    "drop-seq", "dropseq",
+    "smart-seq", "smartseq", "fluidigm c1"
+  )
+  any(vapply(kw, function(k) grepl(k, blob, fixed = TRUE), logical(1)))
+}
+
+for (g in gse_list) {
+  message("Processing ", g, " ...")
+  gse <- tryCatch(suppressMessages(getGEO(g)), error = function(e) {
+    warning(sprintf("getGEO failed for %s: %s", g, e$message))
+    return(NULL)
+  })
+  if (is.null(gse)) next
+
+  # Some GSEs have multiple ExpressionSets (multiple GPLs) — check all
+  eset_list <- gse
+
+  # Check superseries on the first eSet (sufficient in practice)
+  oth1 <- tryCatch(experimentData(eset_list[[1]])@other, error = function(e) list())
+  rel  <- oth1$relation
+  if (!is.null(rel) && any(grepl("^SuperSeries of:", rel))) {
+    message("  Skipping ", g, " (SuperSeries)")
+    next
+  }
+
+  # Build a text blob from series-level metadata and all sample annotations
+  series_txt <- c(oth1$title, oth1$overall_design,
+                  paste(rel, collapse = " "),
+                  paste(oth1$supplementary_file, collapse = " "))
+
+  sample_txt <- tryCatch({
+    # concatenate all pdata fields across all esets
+    paste(
+      unlist(lapply(eset_list, function(es) as.vector(as.matrix(pData(es))))),
+      collapse = " "
+    )
+  }, error = function(e) "")
+
+  # Flag as single-cell if keywords appear anywhere
+  if (is_single_cell_blob(c(series_txt, sample_txt))) {
+    message("  Excluding ", g, " (single-cell/single-nucleus detected)")
+    next
+  }
+
+  # Keep this GSE
+  gse_list_proc <- c(gse_list_proc, g)
+
+  # Print overall_design if present
+  if (!is.null(oth1$overall_design)) {
+    cat("  overall_design:\n")
+    cat(oth1$overall_design, "\n")
+  }
+}
+
+print(gse_list_proc)
+```
+
+
+# Get SRA accessions
+This section is needed if raw data will be downloaded from SRA.
+Any actual download will be performed by a separate job array script, but we need to assign the file names now. Since the raw data file names are based on the SRA accessions, we can infer them from the accessions and the number of reads
+The file names are added to the SDY / GEO metadata so they can be linked later.
+
+```{r echo=FALSE}
+sra_pth <- file.path(ext_path, paste0(sdy_id, "_sra.csv"))
+
+# Check if the SRA metadata CSV exists
+if (file.exists(sra_pth)) {
+  message("Loading existing SRA metadata from: ", sra_pth)
+  sra_metadata_df <- read.csv(sra_pth, check.names = FALSE, stringsAsFactors = FALSE)
+} else {
+  message("No SRA metadata file found. Building now...")
+
+  sra_metadata_df <- NULL
+
+  for (j in seq_along(gse_list_proc)) {
+    # get GEO series (may return a list of platforms)
+    gse <- getGEO(gse_list_proc[[j]])
+
+    # collect sample accessions by crawling GEO page
+    gse_text <- crawl_gse(gse_list_proc[[j]])
+    gsm_list <- extract_gsms(gse_text)
+
+    # fetch SRA metadata for each GSM
+    sra_metadata_list <- lapply(gsm_list, get_sra_metadata)
+    sra_metadata <- do.call(rbind, sra_metadata_list)
+
+    # append to main dataframe
+    if (is.null(sra_metadata_df)) {
+      sra_metadata_df <- sra_metadata
+    } else {
+      sra_metadata_df <- dplyr::bind_rows(sra_metadata_df, sra_metadata)
+    }
+  }
+
+  # Clean and save
+  sra_metadata_df <- dplyr::distinct(sra_metadata_df)
+  colnames(sra_metadata_df)[1] <- "REPOSITORY_ACCESSION"
+  write.csv(sra_metadata_df, file = sra_pth, row.names = FALSE)
+  message("Wrote SRA metadata to: ", sra_pth)
+}
+
+# Continue pipeline
+# Make sure pth is defined for process_sdy()
+sdy_df <- process_sdy(pth)
+sdy_df <- merge(
+  sdy_df,
+  unique(sra_metadata_df[c("REPOSITORY_ACCESSION", "SRR","layout")]),
+  by = "REPOSITORY_ACCESSION",
+  all.x = TRUE
+)
+
+```
+
+# Write ImmPort data to file
+For single-cell we are only downloading the raw data, so no need for a summarizedexperiment object. Here you can write the SDY + GEO metadata as a file.
+
+```{r}
+# create output dir if it doesn't exist, capture return value
+out_dir <- dir_create(path(out_path))
+#sdy_id <-str_match(sdy_file_name, "SDY\\d+")[1]
+write.table(sdy_df, file = path(out_dir, paste0(sdy_id,".tsv")), sep = "\t", 
+              row.names = F)
+#sdy_df <- read.delim(path(out_dir, paste0(sdy_id, ".tsv")), sep = "\t", stringsAsFactors = FALSE)
+```
+
+
+# Download the raw data from SRA
+In the previous chunk we added the FASTQ file names to the SDY dataframe. Here we build (and submit) a job array to run on McCleary. Each job downloads the raw data for a given SRA accession and gzips them. This is done using commands from SRA toolkit.
+
+Once the job array is submitted, this chunk is done. The user can monitor the progress of the jobs directly on McCleary.
+
+May need to be modified based on the hpc system.
+
+```{r}
+# set working dir to sub-dir of where SDY is saved
+out_dir <- dir_create(file.path(out_path,"fastq"))
+# setwd(paste0(work_dir, "/", SDY))
+setwd(out_dir)
+
+# create & save dSQ job script file
+# At this point the SDY DF has the fastq file names, revert fastq_1 back to SRR
+#  by removing the "_1"
+#srr_v <- str_replace(sdy_df$R1_file, "_1", "")
+srr_v <- sdy_df$SRR
+
+# df for commands
+dsq_df <- data.frame(srr = srr_v)
+dsq_df$sra_cmd <- paste0("module load SRA-Toolkit;", 
+                         "fasterq-dump --split-files ",
+                         dsq_df$srr, "; gzip ", dsq_df$srr, "_*")
+
+# rm srr col
+dsq_df <- dsq_df %>% select(!srr)
+dsq_df <- dsq_df %>% distinct()
+
+# write df of commands to wd
+write.table(dsq_df, file = "array_job_list.txt", row.names = F, col.names = F, quote = F)
+
+fastq_dir <- dir_create(file.path(out_path,"fastq"))
+dsq_path <- file.path(fastq_dir, "submit_dsq.sh")
+
+# Script contents
+lines <- c(
+"#!/bin/bash",
+"",
+"# Set SLURM library path manually",
+"export LD_LIBRARY_PATH=/opt/slurm/23.11.10/lib/slurm:$LD_LIBRARY_PATH",
+"",
+"# Run dsq with your submission config",
+"/vast/palmer/apps/avx2/software/dSQ/1.05/dsq \\",
+"  --job-file array_job_list.txt \\",
+"  -p day \\",
+"  -c 2 \\",
+"  --mem-per-cpu 10g \\",
+"  --mail-type ALL \\",
+"  -o dsq-jobfile-%A_%a-%N.out \\",
+"  -t 1-0 \\",
+"  --submit"
+)
+
+# Write file and make it executable
+dir.create(fastq_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines(lines, dsq_path)
+Sys.chmod(dsq_path, "0755")
+
+script    <- file.path(fastq_dir, "submit_dsq.sh")
+
+stopifnot(file.exists(script))
+Sys.chmod(script, "0755")           # ensure executable
+
+```
+
+#Generate fastq samplesheet and submit nf-core/RNA-seq jobs
+
+```{r}
+fastq_dir <- dir_create(file.path(out_path,"fastq"))
+
+# List all FASTQ and FASTQ.GZ files
+all_files <- list.files(fastq_dir, pattern = "\\.fastq(\\.gz)?$", full.names = FALSE)
+
+
+# Extract sample base names (e.g., SRR17736191 from SRR17736191_1.fastq.gz)
+base_names <- gsub("(_[12])?\\.fastq\\.gz$", "", all_files)
+
+# Group by sample name
+samples <- unique(base_names)
+
+
+records <- list()
+
+for (sample in samples) {
+  # Look for paired-end files
+  fq1 <- sort(all_files[grepl(paste0("^", sample, "_1\\.fastq\\.gz$"), all_files)])
+  fq2 <- sort(all_files[grepl(paste0("^", sample, "_2\\.fastq\\.gz$"), all_files)])
+  
+  if (length(fq1) > 0 && length(fq2) > 0) {
+    # Use paired-end mode
+    if (length(fq1) != length(fq2)) {
+      warning(sprintf("Mismatched paired files for %s: %d (R1) vs %d (R2); pairing up to min length.",
+                      sample, length(fq1), length(fq2)))
+    }
+    n <- min(length(fq1), length(fq2))
+    for (i in seq_len(n)) {
+      records[[length(records) + 1]] <- data.frame(
+        sample = sample,
+        fastq_1 = fq1[i],
+        fastq_2 = fq2[i],
+        strandedness = "auto",
+        stringsAsFactors = FALSE
+      )
+    }
+    
+  } else {
+    # Fall back to single-end (expects sample.fastq.gz)
+    fq <- sort(all_files[grepl(paste0("^", sample, "_1\\.fastq\\.gz$"), all_files)])
+    if (length(fq) == 0) {
+      warning(sprintf("No FASTQ found for %s (neither paired nor single-end).", sample))
+    } else {
+      for (f in fq) {
+        records[[length(records) + 1]] <- data.frame(
+          sample = sample,
+          fastq_1 = f,
+          strandedness = "auto",
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+}
+
+samplesheet <- if (length(records)) do.call(rbind, records) else
+  data.frame(sample=character(), fastq_1=character(), fastq_2=character(), strandedness=character())
+# # Prepare output list
+# records <- list()
+# 
+# # Paired-end RNA-seq
+# for (sample in samples) {
+#   fq1 <- all_files[grepl(paste0("^", sample, "_1\\.fastq\\.gz$"), all_files)]
+#   fq2 <- all_files[grepl(paste0("^", sample, "_2\\.fastq\\.gz$"), all_files)]
+#   
+#   fq1_sorted <- sort(fq1)
+#   fq2_sorted <- sort(fq2)
+#   
+#   if (length(fq1_sorted) != length(fq2_sorted)) {
+#     warning(paste("Mismatched files for", sample))
+#   }
+#   
+#   for (i in seq_along(fq1_sorted)) {
+#     records[[length(records) + 1]] <- data.frame(
+#       sample = sample,
+#       fastq_1 = fq1_sorted[i],
+#       fastq_2 = fq2_sorted[i],
+#       strandedness = "auto"
+#     )
+#   }
+# }
+# 
+# # Single-end RNA-seq
+# for (sample in samples) { 
+#   fq <- all_files[grepl(paste0("^", sample, "\\.fastq\\.gz$"), all_files)] 
+#   fq_sorted <- sort(fq) 
+#   for (f in fq_sorted) { 
+#     records[[length(records) + 1]] <- data.frame( 
+#       sample = sample, fastq_1 = f, strandedness = "auto"
+#     )
+#   }
+# }
+# 
+# # Combine records into one data.frame
+# output_df <- do.call(rbind, records)
+
+# Write to CSV
+out_csv <- file.path(out_dir, "fastq_samplesheet.csv")
+write.csv(samplesheet, file = out_csv, row.names = FALSE, quote = FALSE)
+
+```
+
+#write RNAseq_Nextflow.sh file
+Edit the Script based on the system
+```{r}
+# Derived paths
+fastq_dir <- dir_create(file.path(out_path,"fastq"))
+fastq_path <- file.path(fastq_dir, "fastq_samplesheet.csv")
+RNAseq_path <- file.path(fastq_dir, "RNAseq_Nextflow.sh")
+work_base   <- dirname(dirname(out_path))             
+out_base    <- file.path(out_path, "result_counts")
+ref_fa      <- "/vast/palmer/pi/kleinstein/jxing/Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz"
+ref_gtf     <- "/vast/palmer/pi/kleinstein/jxing/Homo_sapiens.GRCh38.113.gtf.gz"
+#optional
+custom_cfg  <- "/vast/palmer/pi/kleinstein/jxing/custom.config" # this is only needed if you want to customize the cofnig file
+
+# Script contents
+lines <- c(
+"#! /bin/bash",
+"#SBATCH --job-name=rnaseq_chunks",
+"#SBATCH --output=slurm-%j.out",
+"#SBATCH --time=7-00:00:00",
+"#SBATCH --cpus-per-task=2",
+"##SBATCH --mem=5G",
+"#SBATCH --mail-type=ALL",
+"#SBATCH --partition=pi_kleinstein",
+"",
+"module load Java/17.0.4",
+"export NXF_WRAPPER_STAGE_FILE_THRESHOLD='40000'",
+"",
+"# 1. Split the samplesheet (50 data rows per file, header preserved)",
+sprintf("in_csv=%s", shQuote(fastq_path)),
+"awk -v CHUNK=50 'NR==1{head=$0; next}
+{
+  f = sprintf(\"fastq_samplesheet_%03d.csv\", int((NR-2)/CHUNK)+1);
+  if (!(f in seen)) { print head > f; seen[f]=1 }
+  print >> f
+  }' \"$in_csv\"",
+"",
+"# 2. Run each chunk",
+sprintf('ref_fa="%s"', ref_fa),
+sprintf('ref_gtf="%s"', ref_gtf),
+sprintf('out_base="%s"', out_base),
+sprintf('work_base="%s"', work_base),
+'',
+'mkdir -p "$out_base" "$work_base"',
+'',
+'for f in fastq_samplesheet_*.csv; do',
+'  chunk="${f%.csv}"  # e.g., fastq_samplesheet_001',
+'  mkdir -p "${work_base}/${chunk}"   # unique work dir for each chunk',
+'',
+'  nextflow run nf-core/rnaseq \\',
+'    -profile mccleary \\',
+sprintf('    -c %s \\', shQuote(custom_cfg)),
+'    -w "${work_base}/${chunk}" \\',
+'    --input "$f" \\',
+'    --outdir "${out_base}/${chunk}" \\',
+'    --fasta "$ref_fa" \\',
+'    --gtf "$ref_gtf" \\',
+'    --skip_qc \\',
+'    --skip_stringtie \\',
+'    --skip_bigwig \\',
+'    --skip_samtools_stats \\',
+'    --skip_markduplicates \\',
+'    -resume \\',
+'    -with-report "${chunk}_report.html" \\',
+'    -with-timeline "${chunk}_timeline.html" \\',
+'    -with-trace',
+'done'
+)
+
+# Write file and make executable
+dir.create(fastq_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines(lines, RNAseq_path)
+Sys.chmod(RNAseq_path, mode = "0755")
+
+
+```
+
+
+
+
+
