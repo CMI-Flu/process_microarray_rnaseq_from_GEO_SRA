@@ -1,0 +1,1 @@
+SRR17736112,fastq/SRR17736112_1.fastq.gz,fastq/SRR17736112_3.fastq.gz,unstranded
